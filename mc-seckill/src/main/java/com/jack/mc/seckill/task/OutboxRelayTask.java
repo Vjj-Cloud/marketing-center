@@ -76,9 +76,6 @@ public class OutboxRelayTask {
     /** 待复核记录等多久再复查：给消费者留出迟到落库的时间 */
     private static final long REVIEW_DELAY_SECONDS = 60L;
 
-    /** 人工回滚进程崩溃后，超过该时间仍未落终态的状态 5 自动退回待复核 */
-    private static final long ROLLING_BACK_TIMEOUT_SECONDS = 120L;
-
     private static final Duration LOCK_TTL = Duration.ofSeconds(20);
 
     /**
@@ -129,9 +126,13 @@ public class OutboxRelayTask {
             // 无锁状态下的投递和对账会被别的实例重复执行，轻则重复投递，重则重复回滚。
             // 上一版只在 relayPending 内部 return，后续的 reconcileSent / reviewPending
             // 照样会在无锁状态下继续跑（第三轮评审 P2）。
-            if (relayPending() && reconcileSent() && reviewPending()) {
-                recoverStaleRollingBack();
+            if (!relayPending()) {
+                return;
             }
+            if (!reconcileSent()) {
+                return;
+            }
+            reviewPending();
         } catch (Exception e) {
             // 定时任务抛异常会被调度器吞掉（只是不再调度这一轮），
             // 但日志会丢，所以这里必须自己接住
@@ -157,7 +158,10 @@ public class OutboxRelayTask {
             boolean sent = mqProducer.send(MqTopics.SECKILL_ORDER, MqTopics.TAG_CREATE,
                     outbox.getActivityId() + "-" + outbox.getUserId(), outbox.getPayload());
             if (sent) {
-                if (outboxService.markSent(outbox.getActivityId(), outbox.getUserId())) {
+                // 带上这一轮读到的预订号：这一行可能已经被 resetAbandoned 复用给下一次抢购，
+                // 只按「活动+用户」更新会把新预订误标成已投递（第七轮评审 P2）
+                if (outboxService.markSent(outbox.getActivityId(), outbox.getUserId(),
+                        outbox.getReservationId())) {
                     log.info("补偿重投成功 outboxId={} activityId={} userId={}",
                             outbox.getId(), outbox.getActivityId(), outbox.getUserId());
                 } else {
@@ -292,27 +296,24 @@ public class OutboxRelayTask {
     }
 
     /**
-     * 人工回滚接口在 CAS 4→5 后若进程崩溃、连接中断，try/finally 不会执行。
-     * 这里把超时的状态 5 退回待复核，避免记录永久失联。
+     * <b>这里原来有一个「状态 5 超时自动退回待复核」的兜底，第七轮评审 P0 已删除。</b>
+     * <p>
+     * 原逻辑：{@code status=5} 超过 120 秒未落终态就无条件 CAS 5→4，
+     * 用来救「人工回滚的进程崩了、try/finally 没执行」的情况。
+     * <p>
+     * 它救不了的同时还会制造超卖：状态 5 本身是<b>排他凭据</b>——
+     * 消费者落库时读到 5 会拒绝（{@code OrderPersistService}），
+     * 所以「管理员持有 5」等于「此刻没人能建单」。而时间无法证明持有者已经死了：
+     * 只要原线程只是慢（Redis 阻塞、GC、网关超时但线程仍在跑），
+     * 到点被改回 4 之后消费者立刻可以落库，原线程随后照旧执行 Redis 回滚，
+     * 就形成「库存已还 + 订单已建」。{@code finally} 拦不住已经被回收的记录。
+     * <p>
+     * 现在改成「不确定就交给人」：卡住的 5 会出现在管理端的待处理列表里
+     * （{@code OutboxAdminController.listReview}），由运维确认原请求确实已死
+     * 之后再调 {@code POST /admin/outbox/{id}/recover} 显式放回 4。
+     * 时间只能用来<b>提示</b>，不能用来<b>决定</b>——这条和「重试耗尽不自动回滚」
+     * 是同一条原则：少卖可以人工补，超卖是资损。
      */
-    private boolean recoverStaleRollingBack() {
-        List<SeckillOutbox> stale = outboxService.findByStatusBefore(
-                OutboxStatus.ROLLING_BACK.getCode(),
-                LocalDateTime.now().minusSeconds(ROLLING_BACK_TIMEOUT_SECONDS),
-                BATCH_SIZE);
-        for (SeckillOutbox outbox : stale) {
-            if (!renewLock()) {
-                return false;
-            }
-            if (outboxService.casStatus(outbox.getId(),
-                    OutboxStatus.ROLLING_BACK.getCode(),
-                    OutboxStatus.NEEDS_REVIEW.getCode())) {
-                log.warn("恢复超时的人工回滚状态 outboxId={} activityId={} userId={}",
-                        outbox.getId(), outbox.getActivityId(), outbox.getUserId());
-            }
-        }
-        return true;
-    }
 
     /** 指数退避：10s、20s、40s…… 上限 5 分钟，避免 broker 故障时把重试打成忙等 */
     private long backoffSeconds(int retryCount) {

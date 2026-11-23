@@ -266,6 +266,8 @@ public class ActivityServiceImpl implements ActivityService {
         vo.setSeckillPrice(activity.getSeckillPrice());
         vo.setTotalStock(activity.getTotalStock());
         vo.setAvailableStock(activity.getAvailableStock());
+        vo.setReservedStock(activity.getReservedStock());
+        vo.setReservationReleasedAt(activity.getReservationReleasedAt());
         vo.setStartTime(activity.getStartTime());
         vo.setEndTime(activity.getEndTime());
         vo.setStatus(activity.getStatus());
@@ -274,6 +276,7 @@ public class ActivityServiceImpl implements ActivityService {
         if (product != null) {
             vo.setProductName(product.getName());
             vo.setOriginalPrice(product.getPrice());
+            vo.setProductStock(product.getStock());
             vo.setDiscount(calcDiscount(activity.getSeckillPrice(), product.getPrice()));
         }
         return vo;

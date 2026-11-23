@@ -21,8 +21,13 @@ public interface OutboxService {
      */
     void savePending(SeckillMessage message, String payload);
 
-    /** 标记为已投递（只有 status=0 时生效），返回是否更新成功 */
-    boolean markSent(Long activityId, Long userId);
+    /**
+     * 标记为已投递（只有 status=0 且预订号一致时生效），返回是否更新成功。
+     * <p>
+     * 必须带 {@code reservationId}：同一行会被 {@code resetAbandoned} 复用来承接
+     * 下一次抢购，旧投递线程若只按「活动+用户」更新，会把新预订误标成已投递。
+     */
+    boolean markSent(Long activityId, Long userId, String reservationId);
 
     List<SeckillOutbox> findPendingToRetry(LocalDateTime now, int limit);
 

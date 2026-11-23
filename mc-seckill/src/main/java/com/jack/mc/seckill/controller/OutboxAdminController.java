@@ -44,6 +44,16 @@ public class OutboxAdminController {
     /** 列表单页上限，防止一次拉爆 */
     private static final int MAX_LIMIT = 200;
 
+    /**
+     * 状态 5 停留多久算「卡住」。
+     * <p>
+     * 一次正常的人工回滚是「一次查询 + 一次 Redis 调用」，毫秒级；
+     * 超过 120 秒几乎只能是进程崩了、连接断了、或某个下游卡死。
+     * 这个阈值只用于<b>提示</b>（列表里标 stalled），不再触发任何自动状态变更——
+     * 理由见 {@link #recover}。
+     */
+    private static final int STALL_SECONDS = 120;
+
     private final OutboxService outboxService;
     private final StockService stockService;
 
@@ -53,17 +63,29 @@ public class OutboxAdminController {
     }
 
     /**
-     * 待人工复核的记录列表。
+     * 待人工处理的记录列表。
      * <p>
-     * 只看 status=4：这些是「重试耗尽、库存还没还」的条目，
-     * 处理完一条少一条，可以作为运维的待办清单。
+     * 两类都列出来，用 {@code state} 区分：
+     * <ul>
+     *   <li>{@code NEEDS_REVIEW(4)}：重试耗尽、库存还没还，处理完一条少一条，是常规待办；</li>
+     *   <li>{@code ROLLING_BACK(5)} 且停留超过 {@link #STALL_SECONDS}：回滚做到一半没落终态，
+     *       {@code state} 为 {@code ROLLING_BACK_STALLED}。<b>第七轮评审 P0 新增</b>——
+     *       原来这类记录会被定时任务无条件改回 4，现在改成列出来给人看，
+     *       因为「时间到了」不等于「原来那次回滚已经不在跑了」。</li>
+     * </ul>
+     * {@code limit} 是「每类上限」而不是总数上限：卡住的 5 不该因为 4 太多而被截掉。
      */
     @GetMapping("/review")
     public Result<List<Map<String, Object>>> listReview(@RequestParam(defaultValue = "50") int limit) {
         int safeLimit = Math.min(Math.max(limit, 1), MAX_LIMIT);
         // 用 0 秒延迟取全量待复核，不走复查任务的 60 秒宽限
-        List<SeckillOutbox> rows = outboxService.findByStatusBefore(
-                OutboxStatus.NEEDS_REVIEW.getCode(), LocalDateTime.now(), safeLimit);
+        List<SeckillOutbox> rows = new ArrayList<>(outboxService.findByStatusBefore(
+                OutboxStatus.NEEDS_REVIEW.getCode(), LocalDateTime.now(), safeLimit));
+        List<SeckillOutbox> stalled = outboxService.findByStatusBefore(
+                OutboxStatus.ROLLING_BACK.getCode(),
+                LocalDateTime.now().minusSeconds(STALL_SECONDS), safeLimit);
+        rows.addAll(stalled);
+
         List<Map<String, Object>> data = new ArrayList<>(rows.size());
         for (SeckillOutbox row : rows) {
             Map<String, Object> item = new LinkedHashMap<>();
@@ -71,6 +93,8 @@ public class OutboxAdminController {
             item.put("activityId", row.getActivityId());
             item.put("userId", row.getUserId());
             item.put("reservationId", row.getReservationId());
+            item.put("status", row.getStatus());
+            item.put("state", stateOf(row.getStatus()));
             item.put("retryCount", row.getRetryCount());
             item.put("lastError", row.getLastError());
             item.put("createdAt", row.getCreatedAt());
@@ -78,6 +102,19 @@ public class OutboxAdminController {
             data.add(item);
         }
         return Result.ok(data);
+    }
+
+    private String stateOf(Integer status) {
+        if (status == null) {
+            return "UNKNOWN";
+        }
+        if (status == OutboxStatus.NEEDS_REVIEW.getCode()) {
+            return "NEEDS_REVIEW";
+        }
+        if (status == OutboxStatus.ROLLING_BACK.getCode()) {
+            return "ROLLING_BACK_STALLED";
+        }
+        return "STATUS_" + status;
     }
 
     /**
@@ -175,5 +212,49 @@ public class OutboxAdminController {
                 log.error("人工回滚过程异常，记录已退回待复核 outboxId={}", id);
             }
         }
+    }
+
+    /**
+     * 把一条卡在「回滚执行中(5)」的记录放回待复核(4)。
+     * <p>
+     * <b>这个接口只能由人调用，调用前必须确认原来那次回滚已经不在了</b>——
+     * 服务重启过、原 HTTP 请求早已断开、或日志里能看到那次回滚已经结束。
+     * <p>
+     * <b>为什么不再自动做（第七轮评审 P0）</b>：状态 5 是排他凭据，
+     * 只要它是 5，消费者落库时就会拒绝（见 mc-order 的 {@code OrderPersistService}），
+     * 所以「谁持有 5 谁独占这一单」。而<b>时间证明不了持有者已死</b>：
+     * 原线程可能只是被 Redis 阻塞、被 GC 挂住、或者网关超时但线程还在跑。
+     * 一旦按时间自动放回 4，消费者立刻可以落库，原线程随后照旧回滚 Redis，
+     * 结果就是「库存已还 + 订单已建」——比记录卡住严重得多。
+     * <p>
+     * 换句话说：卡住的 5 只是「这批货暂时少卖」，最坏人工退掉；
+     * 而误判成已死会直接超卖。所以这里把决定权交给人，
+     * 定时任务只负责把它<b>列进</b> {@code GET /review}（{@code state=ROLLING_BACK_STALLED}）。
+     */
+    @PostMapping("/{id}/recover")
+    public Result<Map<String, Object>> recover(@PathVariable Long id) {
+        SeckillOutbox outbox = outboxService.findById(id);
+        if (outbox == null) {
+            throw new BusinessException(404, "记录不存在");
+        }
+        if (outbox.getStatus() == null
+                || outbox.getStatus() != OutboxStatus.ROLLING_BACK.getCode()) {
+            throw new BusinessException(409,
+                    "只有卡在回滚执行中(5)的记录才需要恢复，当前状态=" + outbox.getStatus());
+        }
+        // CAS 而不是直接 UPDATE：万一原线程刚好在这一刻落终态，这里更新 0 行，
+        // 如实告诉调用者「你来晚了」，而不是把它从 3 覆盖回 4
+        if (!outboxService.casStatus(id, OutboxStatus.ROLLING_BACK.getCode(),
+                OutboxStatus.NEEDS_REVIEW.getCode())) {
+            throw new BusinessException(409, "该记录刚刚已经落终态，请刷新后再看");
+        }
+        log.warn("人工确认回滚线程已失效，记录退回待复核 outboxId={} activityId={} userId={}",
+                id, outbox.getActivityId(), outbox.getUserId());
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("outboxId", id);
+        data.put("status", OutboxStatus.NEEDS_REVIEW.getCode());
+        data.put("note", "已退回待复核，可再次调用 /rollback 执行回滚");
+        return Result.ok(data);
     }
 }

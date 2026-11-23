@@ -33,7 +33,10 @@ public class PingController {
         return Result.ok(Map.of(
                 "service", appName,
                 "status", "up",
-                "time", System.currentTimeMillis()
+                "time", System.currentTimeMillis(),
+                // producer 的状态也报出来：它是「抢购还能不能直达 MQ」的唯一信号。
+                // 启动失败时服务仍然可用（消息落本地表等补偿），所以这里必须是 false 而不是 500
+                "mqProducerStarted", mqProducer.isStarted()
         ));
     }
 

@@ -9,6 +9,7 @@ import org.apache.rocketmq.common.message.Message;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.nio.charset.StandardCharsets;
@@ -23,6 +24,9 @@ import java.nio.charset.StandardCharsets;
  * <p>
  * producer.start() 允许失败：MQ 只是链路的一环，不是启动的必要条件。
  * MQ 挂了服务仍然要能起，抢购请求先写本地消息表，等 broker 恢复后由补偿任务重投。
+ * <p>
+ * 但「允许失败」不等于「失败就算了」：失败后靠 {@link #ensureStarted()} 每 30 秒重试，
+ * 否则一次启动期的网络抖动会让这个进程的发送能力一直失效到下次重启。
  */
 @Component
 public class MqProducer {
@@ -43,27 +47,83 @@ public class MqProducer {
 
     private final String namesrvAddr;
     private final String producerGroup;
-    private final DefaultMQProducer producer;
+
+    /**
+     * 每次启动都新建一个实例，而不是复用字段里的那个。
+     * <p>
+     * {@code DefaultMQProducer.start()} 失败后内部状态可能停在不可恢复的位置，
+     * 再对同一个对象调用 start() 很容易抛 "service state not OK"——
+     * 那等于「重启路径」本身也永远起不来。新建一个对象是唯一确定的做法，
+     * 订单消费者 {@code OrderConsumer} 用的也是这个套路。
+     * <p>
+     * volatile + 不为 null 即「已启动」：发送线程只读这两个字段，不加锁。
+     */
+    private volatile DefaultMQProducer producer;
+    private volatile boolean started;
 
     public MqProducer(@Value("${rocketmq.name-server}") String namesrvAddr,
                       @Value("${rocketmq.producer.group}") String producerGroup) {
         this.namesrvAddr = namesrvAddr;
         this.producerGroup = producerGroup;
-        this.producer = new DefaultMQProducer(producerGroup);
-        this.producer.setNamesrvAddr(namesrvAddr);
-        this.producer.setSendMsgTimeout(SEND_TIMEOUT_MS);
-        this.producer.setRetryTimesWhenSendFailed(RETRY_TIMES);
     }
 
     @PostConstruct
     public void start() {
-        try {
-            producer.start();
-            log.info("RocketMQ producer 启动成功, nameServer={}, group={}", namesrvAddr, producerGroup);
-        } catch (Exception e) {
-            // 不抛异常：MQ 不可用时服务仍应能启动，积压的消息由补偿任务重投
-            log.error("RocketMQ producer 启动失败，MQ 相关功能将不可用. nameServer={}", namesrvAddr, e);
+        if (started) {
+            return;
         }
+        // 只在启动时串行化。发送路径不加锁：broker 挂掉时 start() 可能阻塞数秒，
+        // 让抢购线程排队等它等于把 MQ 故障放大成接口超时
+        synchronized (this) {
+            if (started) {
+                return;
+            }
+            DefaultMQProducer candidate = new DefaultMQProducer(producerGroup);
+            candidate.setNamesrvAddr(namesrvAddr);
+            candidate.setSendMsgTimeout(SEND_TIMEOUT_MS);
+            candidate.setRetryTimesWhenSendFailed(RETRY_TIMES);
+            try {
+                candidate.start();
+                this.producer = candidate;
+                this.started = true;
+                log.info("RocketMQ producer 启动成功, nameServer={}, group={}", namesrvAddr, producerGroup);
+            } catch (Exception e) {
+                // 不抛异常：MQ 不可用时服务仍应能启动，积压的消息由补偿任务重投
+                log.error("RocketMQ producer 启动失败，30 秒后重试. nameServer={}", namesrvAddr, e);
+                try {
+                    candidate.shutdown();
+                } catch (Exception ignore) {
+                    // 启动失败的实例没什么可关的，关不掉也不影响接下来新建一个
+                }
+            }
+        }
+    }
+
+    /**
+     * 启动失败后的自愈路径（第七轮评审 P2）。
+     * <p>
+     * 没有这个任务时，一次客户端初始化异常（配置非法、client 实例创建失败）
+     * 会让这个进程的发送能力<b>永久</b>失效，直到有人重启服务——
+     * 表现是「补偿任务每 5 秒记一次重投失败，库存和消息都堆在本地消息表里」。
+     * 订单消费者早就有 {@code ensureStarted()}，生产者这边一直缺一条对称的路。
+     * <p>
+     * <b>实测边界（别把这条当成「MQ 挂了会自愈」）</b>：停掉 NameServer 再启动服务，
+     * {@code start()} 依然成功——它不依赖 NameServer 可达，只初始化客户端；
+     * 真正失败的是之后的 {@code send()}（{@code No route info of this topic}），
+     * 那个由本地消息表兜住。这条只兜「客户端没起来」这一类，属于防御性修复。
+     * <p>
+     * 30 秒的节奏是照抄消费者的：足够从偶发故障里恢复，又不会在长期故障里刷日志。
+     */
+    @Scheduled(fixedDelay = 30_000L, initialDelay = 30_000L)
+    public void ensureStarted() {
+        if (!started) {
+            log.info("检测到 producer 未启动，尝试重新启动 nameServer={}", namesrvAddr);
+            start();
+        }
+    }
+
+    public boolean isStarted() {
+        return started;
     }
 
     /**
@@ -79,9 +139,16 @@ public class MqProducer {
      * 由本地消息表的补偿任务重投。
      */
     public boolean send(String topic, String tag, String key, String body) {
+        DefaultMQProducer current = this.producer;
+        if (current == null) {
+            // 未启动：不在这里同步重试 start()，那会把秒级的启动耗时压到抢购线程上。
+            // 补偿任务的 30 秒自愈会把它拉起来，期间消息都安全地留在本地消息表里
+            log.debug("producer 未启动，消息留待补偿重投 topic={} key={}", topic, key);
+            return false;
+        }
         try {
             Message message = new Message(topic, tag, key, body.getBytes(StandardCharsets.UTF_8));
-            SendResult result = producer.send(message);
+            SendResult result = current.send(message);
             if (result == null || result.getSendStatus() != SendStatus.SEND_OK) {
                 log.warn("MQ 未确认收到 topic={} key={} status={}",
                         topic, key, result == null ? "null" : result.getSendStatus());
@@ -103,8 +170,14 @@ public class MqProducer {
 
     @PreDestroy
     public void shutdown() {
+        DefaultMQProducer current = this.producer;
+        this.started = false;
+        this.producer = null;
+        if (current == null) {
+            return;
+        }
         try {
-            producer.shutdown();
+            current.shutdown();
         } catch (Exception e) {
             log.warn("producer 关闭异常", e);
         }

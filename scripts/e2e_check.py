@@ -1,4 +1,4 @@
-"""端到端验证：鉴权 → 限流 → 建活动 → 预热 → 并发抢购 → 消费落库 → 对账。
+"""端到端验证：鉴权 → 限流 → 建活动 → 预热 → 并发抢购 → 消费落库 → 对账 → 预留归还。
 
 全部请求走 8081 网关（真实链路：网关鉴权 → 业务服务验签 → Redis/MQ/DB），
 不使用直连端口，否则测不到鉴权与限流。
@@ -6,9 +6,19 @@
 判定标准：
   1. 无 token 被拒 401；直连伪造 X-User-Id 被拒 401
   2. 单用户高频请求触发 429
-  3. 成功笔数 == 剩余库存，Redis 库存归零且不为负
-  4. 每个抢到的用户都能在订单服务查到订单号
-  5. 活动账本 available_stock + 订单数 == total_stock，商品库存按订单数扣减
+  3. 成功笔数 == min(并发人数, 库存)，不超卖；Redis 库存 == 库存 - 成功笔数
+  4. 每个抢到的用户都能在订单服务查到订单号，且订单号不重复
+  5. 活动账本 available_stock + 订单数 == total_stock
+  6. 商品库存：发布时扣 reserved_stock（预留），落库时不再二次扣减，
+     活动结束后只归还未售部分（第七轮评审 P2 补的断言）
+     想专门验证「只归还未售部分」，就把并发人数调到小于库存，
+     例如 3 人抢 5 件：发布后 -5，售出 3 件后归还 2 件。
+
+用法：
+  python e2e_check.py [并发数] [库存] [用户起始ID] [商品ID] [秒杀价] [活动时长秒] [等待归还秒]
+  例：python e2e_check.py 20 5 80000 2 199.00 60 180
+      —— 活动开 60 秒后结束，再等 180 秒看预留库存有没有正确归还。
+  最后一个参数不传（或 0）时跳过归还验证，只验证到「落库后商品库存不再变化」。
 """
 
 import json
@@ -31,6 +41,11 @@ USER_BASE = int(sys.argv[3]) if len(sys.argv) > 3 else 80000
 # 换一个商品就能继续验证。价格必须低于商品原价，否则会被创建接口拒掉。
 PRODUCT_ID = int(sys.argv[4]) if len(sys.argv) > 4 else 2
 SECKILL_PRICE = float(sys.argv[5]) if len(sys.argv) > 5 else 199.00
+# 活动持续时长：默认 30 分钟，够跑完并发；想验证「结束后归还预留」就调短（如 60 秒）
+END_AFTER = int(sys.argv[6]) if len(sys.argv) > 6 else 1800
+# 等待归还的上限秒数。归还依赖两个 30 秒节拍的定时任务（结束状态 + 释放），
+# 留 2 倍余量比较稳；不传就跳过这一步。
+RELEASE_WAIT = int(sys.argv[7]) if len(sys.argv) > 7 else 0
 
 results = {}
 lock = threading.Lock()
@@ -190,6 +205,17 @@ def _fmt(offset_seconds):
     return (datetime.now() + timedelta(seconds=offset_seconds)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def stock_view(activity_id, token):
+    """对账视图：活动账本 + Redis + 已购人数 + 商品库存，一次快照取全。
+
+    必须一次请求取全：分几次请求拿到的是不同时刻的数字，
+    而「商品库存」和「活动账本」要放在一起比较才有意义。
+    """
+    status, body = http("GET", f"{GATEWAY}/api/seckill/activity/{activity_id}/stock", token=token)
+    assert status == 200, f"对账视图查询失败 {status} {body}"
+    return body["data"]
+
+
 def create_activity(token):
     section("4. 创建 → 发布 → 预热")
     # 开始时间留 15 秒：既满足「未开始才能预热」的安全约束，
@@ -201,16 +227,32 @@ def create_activity(token):
         "seckillPrice": SECKILL_PRICE,
         "totalStock": STOCK,
         "startTime": start_at.strftime("%Y-%m-%d %H:%M:%S"),
-        "endTime": (start_at + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"),
+        "endTime": (start_at + timedelta(seconds=END_AFTER)).strftime("%Y-%m-%d %H:%M:%S"),
     }
     status, body = http("POST", f"{GATEWAY}/api/seckill/activity", payload, token=token)
     print(f"  创建活动 → HTTP {status} id={body.get('data')}")
     assert status == 200, f"创建失败 {body}"
     activity_id = body["data"]
 
+    # 发布前先记基线：此刻还没预留，productStock 就是这场活动开始前的商品真实库存。
+    # 后面所有关于「扣了多少、还了多少」的判断都以它为基准。
+    before_publish = stock_view(activity_id, token)
+    baseline_stock = before_publish["productStock"]
+    print(f"  发布前商品库存 → {baseline_stock}（预留 {before_publish.get('reservedStock')} 件）")
+    assert not before_publish.get("reservedStock"), "草稿状态不该预留商品库存"
+
     status, body = http("POST", f"{GATEWAY}/api/seckill/activity/{activity_id}/publish", token=token)
     print(f"  发布活动 → HTTP {status}")
     assert status == 200, f"发布失败 {body}"
+
+    # ★ 第六轮的核心不变量：货在发布时就从 product.stock 扣走了，不是下单时扣。
+    after_publish = stock_view(activity_id, token)
+    print(f"  发布后商品库存 → {after_publish['productStock']}（预留 {after_publish['reservedStock']} 件）")
+    assert after_publish["reservedStock"] == STOCK, \
+        f"发布后应预留 {STOCK} 件，实际 {after_publish['reservedStock']}"
+    assert after_publish["productStock"] == baseline_stock - STOCK, \
+        f"发布应把商品库存从 {baseline_stock} 扣到 {baseline_stock - STOCK}，" \
+        f"实际 {after_publish['productStock']}"
 
     status, body = http("POST", f"{GATEWAY}/api/seckill/activity/{activity_id}/warmup", token=token)
     print(f"  预热库存 → HTTP {status} {body.get('data')}")
@@ -219,7 +261,7 @@ def create_activity(token):
     status, body = http("GET", f"{GATEWAY}/api/seckill/activity/{activity_id}/stock", token=token)
     print(f"  预热后视图 → {body.get('data')}")
     assert body["data"]["redisStock"] == STOCK, "预热后的 Redis 库存不等于活动总库存"
-    return activity_id, start_at
+    return activity_id, start_at, baseline_stock
 
 
 def test_warmup_guard(token, activity_id):
@@ -269,7 +311,7 @@ def run_concurrent(activity_id, tokens, start_at):
     return results
 
 
-def verify(activity_id, tokens, success_count, admin_token):
+def verify(activity_id, tokens, success_count, admin_token, baseline_stock):
     section("7. 消费结果与对账")
 
     def query_one(item):
@@ -302,29 +344,81 @@ def verify(activity_id, tokens, success_count, admin_token):
     assert len(set(order_nos)) == len(order_nos), "出现重复订单号"
 
     # 对账视图含 Redis 实时库存，属于运维信息，需要管理员
-    status, body = http("GET", f"{GATEWAY}/api/seckill/activity/{activity_id}/stock",
-                        token=admin_token)
-    assert status == 200, f"对账视图查询失败 {status} {body}"
-    stock = body["data"]
+    stock = stock_view(activity_id, admin_token)
     print(f"  库存对账视图：{json.dumps(stock, ensure_ascii=False)}")
 
+    # 全部卖完时 sold = STOCK；人比库存少时 sold = 人数。
+    # 用这个「必然结果」当基准，而不是写死 STOCK——
+    # 否则想验证「部分售出后只归还未售部分」时必须改脚本。
+    expected_sold = min(len(tokens), STOCK)
     ok = True
-    if stock["redisStock"] != 0:
-        print(f"  ✗ Redis 库存应为 0，实际 {stock['redisStock']}")
+    if stock["redisStock"] != STOCK - expected_sold:
+        print(f"  ✗ Redis 库存应为 {STOCK - expected_sold}，实际 {stock['redisStock']}")
         ok = False
-    if stock["boughtCount"] != STOCK:
-        print(f"  ✗ 已抢人数应为 {STOCK}，实际 {stock['boughtCount']}")
+    if stock["boughtCount"] != expected_sold:
+        print(f"  ✗ 已抢人数应为 {expected_sold}，实际 {stock['boughtCount']}")
         ok = False
     if stock["dbAvailableStock"] != stock["totalStock"] - len(order_nos):
         print(f"  ✗ 账本库存 {stock['dbAvailableStock']} != 总库存 {stock['totalStock']} - 订单 {len(order_nos)}")
         ok = False
-    if success_count != STOCK:
-        print(f"  ✗ 成功笔数 {success_count} != 库存 {STOCK}")
+    # ★ 第七轮评审 P2：商品库存必须只被扣过一次（发布时预留）。
+    #   这里如果又少了订单数那么多，就是「预留 + 逐单扣减」双扣——
+    #   商品页库存会比真实少卖件数那么多，且活动结束后还回来的数量也对不上。
+    if stock.get("productStock") != baseline_stock - STOCK:
+        print(f"  ✗ 商品库存应为 {baseline_stock - STOCK}（发布时已预留 {STOCK} 件），"
+              f"实际 {stock.get('productStock')}——落库时又扣了一次")
         ok = False
-    if len(order_nos) != STOCK:
-        print(f"  ✗ 落库订单 {len(order_nos)} 笔 != 库存 {STOCK}")
+    if success_count != expected_sold:
+        print(f"  ✗ 成功笔数 {success_count} != 预期 {expected_sold}")
         ok = False
-    print(f"  {'PASS：库存、买家数、订单数三者一致，无超卖' if ok else 'FAIL：对账不一致'}")
+    if len(order_nos) != expected_sold:
+        print(f"  ✗ 落库订单 {len(order_nos)} 笔 != 预期 {expected_sold}")
+        ok = False
+    print(f"  {'PASS：库存、买家数、订单数、商品库存四者一致，无超卖、无双扣' if ok else 'FAIL：对账不一致'}")
+    return ok, len(order_nos)
+
+
+def check_release(activity_id, admin_token, baseline_stock, sold, wait_seconds):
+    """活动结束后，只把「未售」那部分还给商品库存。
+
+    这是第六轮最容易被做错的一步，也是 e2e 脚本之前完全没覆盖的一段：
+      · 不归还 → 商品永久少卖已结束活动的剩余量；
+      · 归还早了 → 迟到订单用的库存已经给了下一场，同一件货卖两次；
+      · 全额归还（而不是只还未售）→ 已卖出去的那部分凭空多出来，直接超卖。
+    归还由两个 30 秒节拍的定时任务驱动（先置结束状态，再释放），所以要等一会儿。
+    """
+    section("8. 活动结束后归还预留库存")
+    if wait_seconds <= 0:
+        print("  跳过：未指定等待时长（第 7 个参数）。")
+        print("  想验证就把活动时长调短，例如：python e2e_check.py 20 5 80000 2 199.00 60 180")
+        return True
+
+    deadline = time.time() + wait_seconds
+    view = {}
+    while time.time() < deadline:
+        view = stock_view(activity_id, admin_token)
+        if view.get("reservationReleased"):
+            break
+        time.sleep(3)
+
+    if not view.get("reservationReleased"):
+        print(f"  ✗ 等了 {wait_seconds}s 仍未归还：{json.dumps(view, ensure_ascii=False)}")
+        print("    排查：活动是否已进入结束状态(2)？outbox 是否还有 0/1/4/5/7 的记录？")
+        return False
+
+    expect = baseline_stock - sold
+    print(f"  已归还：商品库存 {view['productStock']}，期望 {expect}"
+          f"（基线 {baseline_stock} - 售出 {sold}）")
+    print(f"  活动账本：total={view['totalStock']} available={view['dbAvailableStock']}"
+          f" 预留={view['reservedStock']}")
+    ok = True
+    if view["productStock"] != expect:
+        print(f"  ✗ 归还数量不对：多还或少还了 {view['productStock'] - expect} 件")
+        ok = False
+    if view["dbAvailableStock"] != view["totalStock"] - sold:
+        print(f"  ✗ 账本未售数量 {view['dbAvailableStock']} != 总库存 {view['totalStock']} - 已售 {sold}")
+        ok = False
+    print(f"  {'PASS：只归还未售部分，已售出的那部分没有被重复归还' if ok else 'FAIL：归还逻辑不正确'}")
     return ok
 
 
@@ -334,7 +428,7 @@ def main():
     # 建活动/发布/预热/对账都需要管理员，所以这一组用例走 admin
     test_bad_request(admin_token)
     test_rate_limit()
-    activity_id, start_at = create_activity(admin_token)
+    activity_id, start_at, baseline_stock = create_activity(admin_token)
     test_warmup_guard(admin_token, activity_id)
 
     section("6.0 批量取 token")
@@ -344,7 +438,8 @@ def main():
     print(f"  已取 {len(minted)} 个 token")
 
     run_concurrent(activity_id, minted, start_at)
-    ok = verify(activity_id, minted, results.get("QUEUED", 0), admin_token)
+    ok, sold = verify(activity_id, minted, results.get("QUEUED", 0), admin_token, baseline_stock)
+    ok = check_release(activity_id, admin_token, baseline_stock, sold, RELEASE_WAIT) and ok
     print(f"\n活动 ID = {activity_id}（可用 mysql 复核 seckill_activity / seckill_order / product）")
     sys.exit(0 if ok else 1)
 

@@ -45,8 +45,8 @@ public class OutboxServiceImpl implements OutboxService {
     }
 
     @Override
-    public boolean markSent(Long activityId, Long userId) {
-        return outboxMapper.markSent(activityId, userId) > 0;
+    public boolean markSent(Long activityId, Long userId, String reservationId) {
+        return outboxMapper.markSent(activityId, userId, reservationId) > 0;
     }
 
     @Override

@@ -178,7 +178,7 @@ public class SeckillServiceImpl implements SeckillService {
 
         if (sent) {
             try {
-                outboxService.markSent(activityId, userId);
+                outboxService.markSent(activityId, userId, reservationId);
             } catch (Exception e) {
                 // 标记失败不影响结果：记录还是 PENDING，补偿任务会再投一次，
                 // 消费端幂等，多投一次不会多出订单

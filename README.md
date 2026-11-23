@@ -135,8 +135,9 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/auth/me
 | GET | `/api/seckill/activity/{id}/stock` | 对账视图：总库存 / DB 剩余 / Redis 剩余 / 已抢人数 |
 | POST | `/api/seckill/order/{activityId}` | 抢购，返回 QUEUED / SOLD_OUT / REPEATED |
 | GET | `/api/order/result?activityId=` | 查结果：SUCCESS（带订单号）/ QUEUING / NOT_RESERVED |
-| GET | `/api/seckill/admin/outbox/review` | **管理员**：待人工复核的本地消息（库存未回滚） |
+| GET | `/api/seckill/admin/outbox/review` | **管理员**：待人工处理的本地消息（待复核 4 + 卡住的回滚执行中 5） |
 | POST | `/api/seckill/admin/outbox/{id}/rollback` | **管理员**：人工确认后回滚库存（执行前再查一次订单） |
+| POST | `/api/seckill/admin/outbox/{id}/recover` | **管理员**：把卡在「回滚执行中(5)」的记录放回待复核（确认原请求已死之后才调） |
 
 ## 进度
 
@@ -151,6 +152,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/auth/me
 - [x] Day 6.7 第四轮修复：每次扣减唯一预订号、消费中状态、卡死状态恢复、自动化测试
 - [x] Day 6.8 第五轮修复：累计库存校验、请求 ID 限长、孤儿按状态恢复、对账上限、SQL 幂等
 - [x] Day 6.9 第六轮完善：商品库存真实预留、活动结束后安全释放、outbox 复用计数重置
+- [x] Day 6.10 第七轮修复：取消状态 5 按时间自动回收、补活动维度索引、投递标记带预订号、生产者自愈
 - [ ] Day 7 面试问答整理
 
 ## 代码评审修复 · 第一轮（P0/P1/P2）
@@ -481,6 +483,86 @@ broker 不可用时补偿任务单轮最坏 40 秒，这期间预热和释放全
 用户抢购 1 件、订单落库            → product.stock 仍 248（没有第二次扣减）
 活动结束、outbox 全部终态          → 未售 1 件归还，248 → 249
 活动 18 账本：total=2 available=1 reserved=2 released=1 订单=1
+```
+
+## 代码评审修复 · 第七轮
+
+第七轮评审提了 6 条，**逐条核实后 5 条属实、1 条方向对但触发条件比描述的窄**。
+这一轮没有新功能，只有一件事：**把「按时间猜」的地方改成「拿凭据判断」**。
+
+| 级别 | 问题 | 核实结论 | 修复 |
+|---|---|---|---|
+| P0 | 人工回滚进入状态 5 后没有所有权/心跳，120 秒后被恢复任务无条件改回 4 | **属实**（比描述的更严重，见下） | 删掉 `recoverStaleRollingBack`；卡住的 5 进管理端列表（`state=ROLLING_BACK_STALLED`），由 `POST /{id}/recover` 显式放回 4 |
+| P1 | `countActiveByActivity` 与 `findReleasableReservations` 的 `NOT EXISTS` 没有以 `activity_id` 打头的索引 | **属实**，EXPLAIN 实测走 `idx_status_retry`（status 基数极低）| 新增 `sql/09_outbox_activity_index.sql`：`idx_activity_status(activity_id, status)`，幂等 |
+| P2 | `markSent` 只按 `activity_id + user_id` 更新，记录被复用后旧线程会误标新预订 | **属实**（后果是延迟 5 分钟投递，不是丢消息） | where 加 `reservation_id`，接口签名同步改 |
+| P2 | 生产者启动异常被吞掉后没有后台重启路径 | **机制存在，但触发条件比描述窄**（见下） | 仿消费者的 `ensureStarted()`：每 30 秒检查，失败就新建实例重启 |
+| P2 | e2e 脚本声称检查商品库存，实际只查了活动账本/Redis/买家数/订单数 | **属实**（脚本头的第 5 条判定标准就是空头支票） | 对账视图加 `productStock/reservedStock/reservationReleased`，脚本补三段断言 |
+| P2 | 只有 Mockito 单元测试，没有启动 Spring、跑真实 SQL、接 Redis/MQ 的集成测试；迁移是 9 个手工 SQL | **属实**，但不在这一轮改（理由见下） | 记为后续项，不假装解决 |
+
+**P0 为什么比评审说的更严重。** 评审担心的是「原线程很慢 + 消费者抢到 7 并落单」。
+实际读代码后发现，状态 5 本身就是那把锁：消费者落库事务里读到 5 会直接
+`OrderRejectedException`（见 `mc-order` 的 `OrderPersistService`），
+所以「持有 5」= 「此刻这一单没人能动」。定时任务把 5 改回 4，等于**替一个可能还活着的线程
+把锁撬了**：一旦放回 4，消费者就会照常落库，而原线程随后仍会执行 Redis 回滚，
+最终「库存已还 + 订单已建」——正是 `OutboxAdminController` 整个类存在的意义所在
+（它前 100 行注释都在论证怎么避免这个结局）。
+
+`finally` 拦不住这种回收：finally 只保证「我这个线程退出时把状态改回去」，
+而记录已经被别的线程改过，CAS 会更新 0 行——那一刻它连自己失去了所有权都不知道。
+
+**修法选了「交给人」这条。** 评审给了两个方向：owner token + 租约续期 + fencing，
+或者取消自动回收。选后者，理由是**时间无法证明持有者已死**：
+只要还用「N 秒没动静就当它死了」，就还是同一个赌局，只是把窗口从 120 秒缩到 30 秒。
+租约 + fencing 能真正解决，但要在 `seckill_outbox` 上加 owner/lease 两列、
+给回滚接口加心跳线程、给 Redis 回滚脚本加 fencing token——为了一个**只在管理端手工触发**
+的低频操作，成本明显不划算。
+
+现在的处置链是：卡住的 5 出现在 `GET /review`（`state=ROLLING_BACK_STALLED`），
+运维确认「那次请求确实没了」（服务重启过 / 日志里已结束）再调 `POST /{id}/recover`。
+最坏结果是这批货暂时少卖、人工退掉；比超卖轻一个量级——和「重试耗尽不自动回滚」是同一条原则。
+
+**P2 生产者那条要说清楚。** 机制确实缺：`@PostConstruct` 里 `producer.start()` 失败后
+只有一行 error 日志，之后所有 `send()` 都返回 false，直到服务重启。
+但我实测了「把 NameServer 停掉再启动服务」——**`start()` 依然成功**，
+因为 `DefaultMQProducer.start()` 不依赖 NameServer 可达，它只初始化客户端；
+真正失败的是之后的 `send()`（`No route info of this topic`），
+而那本来就该由本地消息表兜住（实测：NameServer 恢复后第一次 `send` 失败、第二次成功，
+中间没有任何代码重启）。所以这条修复是**防御性**的：为「客户端初始化异常」
+（配置非法、client 实例创建失败）留一条自愈路径，不是修一个已知必现的故障。
+照抄消费者的做法，顺便还修正了一个隐患：**每次重试都新建 producer 实例**——
+`DefaultMQProducer.start()` 失败后内部状态可能停在不可恢复的位置，
+对同一个对象再 `start()` 会抛 `service state not OK`，那「重启路径」本身也永远起不来。
+
+**P2 商品库存断言这条，是本轮唯一能顺手补上的「测试缺口」。** 上一轮用人工操作验证了
+「250 → 248 → 249」，但脚本里没有这一步，等于回归时没人能自动发现双扣。
+现在对账视图一次返回四组数（活动账本 / Redis / 已抢人数 / `product.stock`），
+脚本按「发布前记基线」的方式断言三段：
+发布后 `-STOCK`、落库后不变、结束后只 `+未售`。这条断言必须**一次请求取全**，
+分两次请求拿到的是两个时刻的库存，比较就没有意义了。
+
+**测试与部署（不做，但要说明理由）。** 引入 Flyway 的前提是把 9 个手工 SQL 变成
+「只跑一次、有版本历史」的迁移集，而现在这些脚本里 `07_reconcile_activity7.sql`
+是一次性数据修复、`03`/`09` 靠 `information_schema` 手写幂等——直接塞进 Flyway
+会把「一次性修复」变成「每次新环境都执行的迁移」，语义反而更糟。Testcontainers 需要 Docker，这台开发机上没有，且项目依赖
+Nacos/RocketMQ 两个重中间件，容器化的收益低于「一个能复现的 e2e 脚本」。
+所以本轮的取舍是：**把这唯一能自动化的一段（商品库存）补进 e2e 脚本**，其余记为后续项。
+
+### 实测（2026-11-24 03:05，新 jar + 全部服务重启）
+
+```
+索引：EXPLAIN 前 key=idx_status_retry(filtered 10%) → 后 key=idx_activity_status(Using index, filtered 100%)
+      NOT EXISTS 子查询：前 range 扫 → 后 ref + Using index + Not exists
+状态 5：插入一条 updated_at=5 分钟前的 status=5 记录，25 秒（补偿任务 5 轮）后仍是 5（旧代码这里会变 4）
+        GET /review → state=ROLLING_BACK_STALLED
+        POST /recover → 200 {status:4}；再调 → 409；不存在的 id → 404
+e2e 3 人抢 5 件（活动 22，商品 10）：
+        基线 255 → 发布 250（预留 5）→ 3 单落库后仍 250（无二次扣减）
+        → 结束后归还未售 2 件 → 252
+        账本 total=5 available=2；Redis 库存 2；已抢 3；订单 3
+e2e 20 人抢 5 件（活动 21）：5 单全部落库，product.stock 260 → 255 全程只扣一次
+producer 自愈：停 NameServer 起服务，start() 仍成功（说明这条是防御性修复）；
+        NameServer 恢复后 send 第 1 次失败、第 2 次成功，未重启服务
+测试：42 个（新增 OutboxAdminControllerTest 6 个）全绿
 ```
 
 ## 关键设计

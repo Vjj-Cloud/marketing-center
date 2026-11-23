@@ -47,13 +47,24 @@ public interface SeckillOutboxMapper extends BaseMapper<SeckillOutbox> {
      * where 里带 status = 0 是刻意的：补偿任务和主流程可能同时想改这一条，
      * 带上状态条件后，只有先到的那次生效，后到的返回 0 —— 用它判断
      * 「这一条是不是已经被别人处理过了」，避免重复标记引发的日志噪音。
+     * <p>
+     * <b>为什么还要带 reservation_id（第七轮评审 P2）</b>：
+     * status=0 不足以区分「同一条」和「同一行的下一次使用」。
+     * 一行被人工回滚(3)或入口中止(6)之后，用户重新抢购会走
+     * {@link #resetAbandoned} 把<b>同一行</b>改成 status=0 并换上新的预订号和 payload。
+     * 此时补偿任务手里还攥着旧预订号的快照，它发完旧 payload 再来 markSent，
+     * 就会把「新预订还没发出去」的记录标成已投递——新消息只能等 5 分钟对账
+     * 打回才真的发出去。带上预订号后，旧线程更新 0 行，如实变成「我来晚了」。
      */
     @Update("""
             UPDATE seckill_outbox
             SET status = 1, last_error = ''
-            WHERE activity_id = #{activityId} AND user_id = #{userId} AND status = 0
+            WHERE activity_id = #{activityId} AND user_id = #{userId}
+              AND reservation_id = #{reservationId} AND status = 0
             """)
-    int markSent(@Param("activityId") Long activityId, @Param("userId") Long userId);
+    int markSent(@Param("activityId") Long activityId,
+                 @Param("userId") Long userId,
+                 @Param("reservationId") String reservationId);
 
     /** 重投失败：累加次数、写入退避时间与错误摘要 */
     @Update("""

@@ -66,9 +66,19 @@ public class ActivityController {
     }
 
     /**
-     * 库存对账视图：同时给出 DB、Redis、已购人数三个数。
+     * 库存对账视图：同时给出 DB、Redis、已购人数、商品库存四组数。
      * 压测后用它一眼判断有没有超卖——
      * redisStock 归零、boughtCount 等于总库存、且两者相加等于 totalStock，才叫正确。
+     * <p>
+     * {@code productStock / reservedStock / reservationReleased} 是第六轮「真实预留」
+     * 之后才需要看的三个数，第七轮评审 P2 补上来（否则 e2e 脚本无从证明
+     * 「预留后不双扣、结束后只归还未售部分」）：
+     * <ul>
+     *   <li>发布后：{@code productStock} 应比发布前少 {@code reservedStock}；</li>
+     *   <li>落库后：{@code productStock} <b>不该再变</b>——货在发布时就扣走了；</li>
+     *   <li>结束后：{@code productStock} 只应加回「未售」那部分，即
+     *       {@code availableStock}，且 {@code reservationReleased} 只会变一次。</li>
+     * </ul>
      */
     @GetMapping("/{id}/stock")
     @RequireAdmin
@@ -79,6 +89,9 @@ public class ActivityController {
         data.put("dbAvailableStock", vo.getAvailableStock());
         data.put("redisStock", stockService.currentStock(id));
         data.put("boughtCount", stockService.boughtCount(id));
+        data.put("reservedStock", vo.getReservedStock());
+        data.put("productStock", vo.getProductStock());
+        data.put("reservationReleased", vo.getReservationReleasedAt() != null);
         return Result.ok(data);
     }
 

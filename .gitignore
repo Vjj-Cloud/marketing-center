@@ -1,0 +1,30 @@
+# Build output
+target/
+**/target/
+
+# IDE
+.idea/
+*.iml
+
+# Secrets and local configuration
+.env
+.env.*
+application-local.yml
+application-local.yaml
+
+# Logs and runtime files
+*.log
+logs/
+hs_err_pid*
+replay_pid*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Temporary audit/build directories
+.audit-build-*/

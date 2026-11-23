@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.jack</groupId>
+        <artifactId>marketing-center</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>mc-gateway</artifactId>
+    <name>mc-gateway</name>
+    <description>网关：统一入口、JWT 鉴权、路由、令牌桶限流</description>
+
+    <dependencies>
+        <!-- 注意：Gateway 是 WebFlux 的，绝不能引 spring-boot-starter-web，
+             两者同时存在会导致 Gateway 无法启动 -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-gateway</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId>
+        </dependency>
+        <!-- RequestRateLimiter 默认实现是 Redis 令牌桶，必须有 reactive redis -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-loadbalancer</artifactId>
+        </dependency>
+        <!--
+          只借用 mc-common 里的 JwtUtils / GatewaySigner。
+          这两个类只依赖 jjwt 和 JDK，不碰 Servlet——网关的组件扫描范围是
+          com.jack.mc.gateway，不会把 mc-common 里的 Filter/异常处理器拉进来。
+        -->
+        <dependency>
+            <groupId>com.jack</groupId>
+            <artifactId>mc-common</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,50 @@
+server:
+  port: 8083
+
+spring:
+  application:
+    name: mc-order
+
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      timeout: 2000ms
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/jianxuan_mall?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: ${DB_USERNAME:mall}
+    password: ${DB_PASSWORD}
+
+  jackson:
+    default-property-inclusion: non_null
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+
+rocketmq:
+  name-server: 127.0.0.1:9876
+  consumer:
+    group: mc-order-consumer
+    topic: SeckillOrderTopic
+    tag: create
+
+# 必须和网关用同一套密钥，负责校验网关写下来的身份签名
+mc:
+  auth:
+    # 无默认值，缺配置启动即失败（同网关）
+    secret: ${JWT_SECRET}
+    expire-seconds: 7200
+    sign-window-seconds: 300
+    whitelist: /api/auth/token,/api/seckill/ping,/api/order/ping
+
+logging:
+  level:
+    com.jack.mc: debug

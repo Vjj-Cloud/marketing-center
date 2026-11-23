@@ -1,0 +1,12 @@
+# 本地联调专用配置。用 --spring.profiles.active=dev 显式激活，
+# 绝不能出现在生产启动参数里。
+#
+# 这个文件存在的意义，就是把「危险开关」和「基础配置」物理隔开：
+# 基础配置里 mock-login-enabled 恒为 false，任何环境直接启动都是安全的；
+# 只有显式激活 dev profile，才会把模拟登录打开。
+# 这样评审时只需看一个文件，「生产会不会误开」这个问题一眼就能回答。
+mc:
+  auth:
+    # 允许 POST /api/auth/token 用任意 userId + role 换 token。
+    # 仅供本地压测和联调；上线前确认启动参数里没有 dev profile。
+    mock-login-enabled: true

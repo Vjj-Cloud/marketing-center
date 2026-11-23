@@ -1,0 +1,93 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: mc-seckill
+
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+        # 开发环境关掉心跳日志刷屏
+        watch-delay: 1000
+
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      timeout: 3000ms
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/jianxuan_mall?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: ${DB_USERNAME:mall}
+    password: ${DB_PASSWORD}
+    hikari:
+      # 默认 10 个连接在 200 并发下会变成排队点：每个请求至少占用
+      # 「查活动」和「插本地消息表」两次连接，10 个连接等于把并发度砍到 10。
+      # 注意上限不是越大越好：连接数超过数据库 max_connections(默认 151) 会直接连不上，
+      # 且 MySQL 单机超过 50 个活跃连接后，上下文切换反而会拉低吞吐。
+      maximum-pool-size: 30
+      minimum-idle: 10
+      connection-timeout: 3000
+
+  jackson:
+    default-property-inclusion: non_null
+
+  task:
+    scheduling:
+      # 本服务有 4 个 @Scheduled 任务：补偿投递(5s)、孤儿兜底(30s)、
+      # 库存预热(30s)、预留释放(30s)。Spring Boot 默认调度线程池只有 **1** 个线程，
+      # 四个任务会在这个唯一线程上排队。
+      #
+      # 这不是理论风险：补偿任务每轮最多处理 20 条、每条一次同步发送，
+      # broker 不可用时单轮最坏 40 秒（每条约 2 秒超时）。这 40 秒里
+      # 「预热」和「预留释放」一个都跑不了——新活动到点却灌不进 Redis，
+      # 用户看到的是 NOT_WARMED；已结束活动的预留库存也迟迟不归还。
+      # 也就是说，一个中间件故障会被放大成「秒杀不可用」，两个故障源互相牵连。
+      #
+      # 取 4 而不是给每个任务留余量：任务之间没有共享状态，
+      # 真正需要的是「一个任务卡住时其余任务还能跑」，
+      # 4 个线程刚好让每个任务互不排队。加更多线程也不会更快，
+      # 因为瓶颈在 Redis/MQ 的往返，不在 CPU。
+      pool:
+        size: 4
+      thread-name-prefix: mc-sched-
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      logic-delete-field: deleted
+
+rocketmq:
+  name-server: 127.0.0.1:9876
+  producer:
+    group: mc-seckill-producer
+
+# 与网关共享同一套密钥：网关签、本服务验，双方必须一致
+mc:
+  auth:
+    # 无默认值，缺配置启动即失败（同网关，见那边的说明）
+    secret: ${JWT_SECRET}
+    expire-seconds: 7200
+    # 模拟登录开关，**基础配置里必须是 false**。
+    # 这个接口没有任何凭据校验：开了之后任何人都能 POST /api/auth/token
+    # 给自己签一个 role=ADMIN 的 token，整套角色权限就成了摆设。
+    # 第三轮评审指出上一版写死 true 是 P0 —— 上一个版本只是「默认不配置即关闭」，
+    # 但配置文件里明摆着 true，等于所有环境默认全开，审核时一眼就该打回。
+    # 本地联调/压测请用 application-dev.yml（启动加 --spring.profiles.active=dev）。
+    mock-login-enabled: false
+    # 签名时间戳的有效窗口（秒），防重放
+    sign-window-seconds: 300
+    # 这些路径不校验网关签名。
+    # 只放 /api/auth/token（拿 token 的入口本身不能要求 token）和健康检查；
+    # 不要写成 /api/auth/**，否则 /api/auth/me 这类需要身份的接口也会被放行，
+    # 网关就不会注入 X-User-Id，接口反而拿不到当前用户。
+    whitelist: /api/auth/token,/api/seckill/ping,/api/order/ping
+
+logging:
+  level:
+    com.jack.mc: debug

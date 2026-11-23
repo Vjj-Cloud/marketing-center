@@ -1,0 +1,80 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: mc-gateway
+
+  # 令牌桶的状态存在 Redis 里，多网关实例才能共享同一份计数
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      timeout: 2000ms
+
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+
+    gateway:
+      discovery:
+        locator:
+          enabled: false
+      routes:
+        # 联调用的模拟登录接口，不需要 token（否则没法拿第一个 token）
+        - id: auth-route
+          uri: lb://mc-seckill
+          predicates:
+            - Path=/api/auth/**
+        - id: seckill-route
+          uri: lb://mc-seckill
+          predicates:
+            - Path=/api/seckill/**
+          filters:
+            # 按 userId 限流而不是按 IP：
+            #   按 IP 限流会误伤同一个公司/学校出口 NAT 后面的所有用户；
+            #   按 userId 限流才是「防单用户刷脚本」的正确粒度。
+            # replenishRate=20 表示稳态 20 次/秒，burstCapacity=20 表示允许瞬时 20 次突发。
+            # 两者相等时桶里不会有积压，超出的请求直接 429，不会排队拖长响应。
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userKeyResolver}"
+                redis-rate-limiter.replenishRate: 20
+                redis-rate-limiter.burstCapacity: 20
+                redis-rate-limiter.requestedTokens: 1
+        - id: order-route
+          uri: lb://mc-order
+          predicates:
+            - Path=/api/order/**
+      httpclient:
+        connect-timeout: 2000
+        # 响应超时必须大于下游最坏耗时：
+        #   下游发送超时 1s × (1 + 1 次重试) = 2s，加 DB/Redis 约 0.2s，
+        #   所以 5s 有足够余量。改小了下游还在重试、网关已经先返回 504，
+        #   用户看到失败但订单其实建成了——最坏的一种体验。
+        response-timeout: 5s
+
+# 网关是唯一可信的身份入口
+mc:
+  auth:
+    # 没有默认值：这是刻意的 fail-fast。
+    # 第一版写的是 ${JWT_SECRET:mc-dev-only-...}，看起来「开箱即用」，
+    # 实际上是给生产留了一把人人可见的钥匙——部署时忘了设环境变量，
+    # 服务照样正常启动，攻击者拿这个公开默认值就能签出任意用户的 token。
+    # 现在缺配置直接抛 Could not resolve placeholder，启动即失败，
+    # 把「配置事故」变成「部署时立刻发现」，而不是「上线后被利用」。
+    # 本地启动：set JWT_SECRET=<32 字节以上的随机串>
+    secret: ${JWT_SECRET}
+    expire-seconds: 7200
+    # 只放拿 token 的入口。写成 /api/auth/** 会把 /api/auth/me 也放过，
+    # 那个接口需要网关注入 X-User-Id，放行后反而取不到用户身份。
+    #
+    # 两个 /ping 一起放行：它们是探活接口，不带身份、不碰数据。
+    # 不放的话监控/负载均衡只能直连 8082/8083（绕过网关），
+    # 一旦服务注册地址变化就会误判成「服务挂了」。
+    whitelist: /api/auth/token,/api/seckill/ping,/api/order/ping
+
+logging:
+  level:
+    com.jack.mc: debug

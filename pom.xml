@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.jack</groupId>
+    <artifactId>marketing-center</artifactId>
+    <version>1.0.0</version>
+    <packaging>pom</packaging>
+    <name>marketing-center</name>
+    <description>闪购营销中心 · 为简选商城提供秒杀能力</description>
+
+    <!--
+      版本组合是刻意锁死的，不要随手升级：
+        Boot 3.2.x  ↔  Spring Cloud 2023.0.x  ↔  Spring Cloud Alibaba 2023.0.3.2
+      这三者是一套经过官方兼容性验证的组合。SCA 对 Boot 3.3+ 的支持在
+      2023.0.3.x 上并不完整，升 Boot 会直接卡在 Nacos 自动配置报错。
+    -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.12</version>
+        <relativePath/>
+    </parent>
+
+    <modules>
+        <module>mc-common</module>
+        <module>mc-gateway</module>
+        <module>mc-seckill</module>
+        <module>mc-order</module>
+    </modules>
+
+    <properties>
+        <java.version>17</java.version>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <spring-cloud.version>2023.0.3</spring-cloud.version>
+        <spring-cloud-alibaba.version>2023.0.3.2</spring-cloud-alibaba.version>
+        <mybatis-plus.version>3.5.7</mybatis-plus.version>
+        <rocketmq.version>5.3.1</rocketmq.version>
+        <jjwt.version>0.12.6</jjwt.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.alibaba.cloud</groupId>
+                <artifactId>spring-cloud-alibaba-dependencies</artifactId>
+                <version>${spring-cloud-alibaba.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.baomidou</groupId>
+                <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+                <version>${mybatis-plus.version}</version>
+            </dependency>
+            <!--
+              MQ 客户端用 4.x 风格的默认实现（DefaultMQProducer / DefaultMQPushConsumer），
+              不用 5.x 新的 gRPC SDK，也不引 rocketmq-spring-boot-starter：
+              前者资料少、不适合面试讲；后者对 Boot 3.2 的自动配置偶发冲突。
+              自己封装 50 行，反而能把发送/消费流程讲清楚。
+            -->
+            <dependency>
+                <groupId>org.apache.rocketmq</groupId>
+                <artifactId>rocketmq-client</artifactId>
+                <version>${rocketmq.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.jack</groupId>
+                <artifactId>mc-common</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <!--
+              jjwt 必须三件套齐全：api 编译期、impl 运行期、jackson 负责 JSON 载荷。
+              只引 api 会在运行时报 "Unable to discover any JJWT implementation"。
+            -->
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-api</artifactId>
+                <version>${jjwt.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-impl</artifactId>
+                <version>${jjwt.version}</version>
+                <scope>runtime</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.jsonwebtoken</groupId>
+                <artifactId>jjwt-jackson</artifactId>
+                <version>${jjwt.version}</version>
+                <scope>runtime</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <configuration>
+                        <excludes>
+                            <exclude>
+                                <groupId>org.projectlombok</groupId>
+                                <artifactId>lombok</artifactId>
+                            </exclude>
+                        </excludes>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+    </build>
+</project>

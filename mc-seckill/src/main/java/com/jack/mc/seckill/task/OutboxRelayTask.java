@@ -310,7 +310,8 @@ public class OutboxRelayTask {
      * <p>
      * 现在改成「不确定就交给人」：卡住的 5 会出现在管理端的待处理列表里
      * （{@code OutboxAdminController.listReview}），由运维确认原请求确实已死
-     * 之后再调 {@code POST /admin/outbox/{id}/recover} 显式放回 4。
+     * 之后再调 {@code POST /admin/outbox/{id}/recover}，在状态 5 上幂等重试回滚。
+     * 重试成功才进入 3，失败或结果不确定仍保持 5。
      * 时间只能用来<b>提示</b>，不能用来<b>决定</b>——这条和「重试耗尽不自动回滚」
      * 是同一条原则：少卖可以人工补，超卖是资损。
      */

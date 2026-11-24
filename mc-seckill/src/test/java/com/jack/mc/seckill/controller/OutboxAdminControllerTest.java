@@ -4,6 +4,7 @@ import com.jack.mc.common.BusinessException;
 import com.jack.mc.common.Result;
 import com.jack.mc.seckill.entity.SeckillOutbox;
 import com.jack.mc.seckill.enums.OutboxStatus;
+import com.jack.mc.seckill.enums.RollbackOutcome;
 import com.jack.mc.seckill.service.OutboxService;
 import com.jack.mc.seckill.service.StockService;
 import org.junit.jupiter.api.BeforeEach;
@@ -29,17 +30,14 @@ import static org.mockito.Mockito.when;
 /**
  * 人工处置入口的状态机。
  * <p>
- * 这一轮（第七轮评审 P0）改的是「状态 5 怎么离开」：
- * 原来超时 120 秒会被定时任务无条件改回 4，而 5 本身是排他凭据——
- * 改回 4 就等于允许消费者落库，原回滚线程若还活着、随后又归还了 Redis 库存，
- * 就是「库存已还 + 订单已建」。
+ * 状态 5 是人工回滚期间的排他凭据。Redis 回滚失败或数据库落终态失败时，
+ * 库存是否已经归还都是不确定的，因此记录必须继续停在 5，不能退回 4。
  * <p>
- * 所以现在只有两条离开路径：接口自己的 finally（同进程内），
- * 和运维确认后显式调用 {@code /recover}。这里锁住这两点：
+ * 允许的路径只有：
  * <ul>
- *   <li>卡住的 5 必须出现在 {@code /review} 列表里，否则它既不会被处理、
- *       也不会被人看到，等于永久失联；</li>
- *   <li>{@code /recover} 只能从 5 出发，且必须走 CAS——不能把它从 3/2 覆盖回来。</li>
+ *   <li>4 → 5 → 3：首次回滚并得到明确结果；</li>
+ *   <li>5 → 3：结果不确定后，在同一把锁下幂等重试；</li>
+ *   <li>5 → 5：任何不确定性都保持锁，等待下一次重试。</li>
  * </ul>
  */
 class OutboxAdminControllerTest {
@@ -47,12 +45,13 @@ class OutboxAdminControllerTest {
     private static final long OUTBOX_ID = 42L;
 
     private OutboxService outboxService;
+    private StockService stockService;
     private OutboxAdminController controller;
 
     @BeforeEach
     void setUp() {
         outboxService = mock(OutboxService.class);
-        StockService stockService = mock(StockService.class);
+        stockService = mock(StockService.class);
         controller = new OutboxAdminController(outboxService, stockService);
     }
 
@@ -96,16 +95,104 @@ class OutboxAdminControllerTest {
     }
 
     @Test
-    void recoverMovesStalledRowBackToReview() {
+    void rollbackFromNeedsReviewMarksRolledBackAfterDefinitiveRedisResult() {
+        SeckillOutbox row = row(OUTBOX_ID, 19L, 1001L, OutboxStatus.NEEDS_REVIEW.getCode());
+        when(outboxService.findById(OUTBOX_ID)).thenReturn(row);
+        when(outboxService.casStatus(OUTBOX_ID,
+                OutboxStatus.NEEDS_REVIEW.getCode(), OutboxStatus.ROLLING_BACK.getCode()))
+                .thenReturn(true);
+        when(stockService.rollback(19L, 1001L, "r-" + OUTBOX_ID))
+                .thenReturn(RollbackOutcome.RESTORED);
+        when(outboxService.casStatus(OUTBOX_ID,
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.ROLLED_BACK.getCode()))
+                .thenReturn(true);
+
+        Result<Map<String, Object>> result = controller.rollback(OUTBOX_ID);
+
+        assertEquals(OutboxStatus.ROLLED_BACK.getCode(), result.getData().get("status"));
+        assertEquals("RESTORED", result.getData().get("outcome"));
+    }
+
+    @Test
+    void rollbackFromRollingBackRetriesWithoutReopeningReview() {
+        SeckillOutbox row = row(OUTBOX_ID, 19L, 1001L, OutboxStatus.ROLLING_BACK.getCode());
+        when(outboxService.findById(OUTBOX_ID)).thenReturn(row);
+        when(stockService.rollback(19L, 1001L, "r-" + OUTBOX_ID))
+                .thenReturn(RollbackOutcome.NOTHING_TO_DO);
+        when(outboxService.casStatus(OUTBOX_ID,
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.ROLLED_BACK.getCode()))
+                .thenReturn(true);
+
+        Result<Map<String, Object>> result = controller.rollback(OUTBOX_ID);
+
+        assertEquals(OutboxStatus.ROLLED_BACK.getCode(), result.getData().get("status"));
+        verify(outboxService, never()).casStatus(OUTBOX_ID,
+                OutboxStatus.NEEDS_REVIEW.getCode(), OutboxStatus.ROLLING_BACK.getCode());
+    }
+
+    @Test
+    void redisRollbackFailureKeepsExclusiveStateFive() {
+        when(outboxService.findById(OUTBOX_ID))
+                .thenReturn(row(OUTBOX_ID, 19L, 1001L, OutboxStatus.NEEDS_REVIEW.getCode()));
+        when(outboxService.casStatus(OUTBOX_ID,
+                OutboxStatus.NEEDS_REVIEW.getCode(), OutboxStatus.ROLLING_BACK.getCode()))
+                .thenReturn(true);
+        when(stockService.rollback(19L, 1001L, "r-" + OUTBOX_ID))
+                .thenReturn(RollbackOutcome.FAILED);
+
+        BusinessException e = assertThrows(BusinessException.class,
+                () -> controller.rollback(OUTBOX_ID));
+
+        assertEquals(503, e.getCode());
+        verify(outboxService, never()).casStatus(OUTBOX_ID,
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.NEEDS_REVIEW.getCode());
+    }
+
+    @Test
+    void databaseFailureAfterRedisSuccessKeepsExclusiveStateFive() {
         when(outboxService.findById(OUTBOX_ID))
                 .thenReturn(row(OUTBOX_ID, 19L, 1001L, OutboxStatus.ROLLING_BACK.getCode()));
+        when(stockService.rollback(19L, 1001L, "r-" + OUTBOX_ID))
+                .thenReturn(RollbackOutcome.RESTORED);
         when(outboxService.casStatus(OUTBOX_ID,
-                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.NEEDS_REVIEW.getCode()))
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.ROLLED_BACK.getCode()))
+                .thenThrow(new IllegalStateException("db unavailable"));
+
+        assertThrows(IllegalStateException.class, () -> controller.rollback(OUTBOX_ID));
+
+        verify(outboxService, never()).casStatus(OUTBOX_ID,
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.NEEDS_REVIEW.getCode());
+    }
+
+    @Test
+    void recoverRetriesStalledRollbackWithoutReturningToReview() {
+        when(outboxService.findById(OUTBOX_ID))
+                .thenReturn(row(OUTBOX_ID, 19L, 1001L, OutboxStatus.ROLLING_BACK.getCode()));
+        when(stockService.rollback(19L, 1001L, "r-" + OUTBOX_ID))
+                .thenReturn(RollbackOutcome.RESTORED);
+        when(outboxService.casStatus(OUTBOX_ID,
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.ROLLED_BACK.getCode()))
                 .thenReturn(true);
 
         Result<Map<String, Object>> result = controller.recover(OUTBOX_ID);
 
-        assertEquals(OutboxStatus.NEEDS_REVIEW.getCode(), result.getData().get("status"));
+        assertEquals(OutboxStatus.ROLLED_BACK.getCode(), result.getData().get("status"));
+        verify(stockService).rollback(19L, 1001L, "r-" + OUTBOX_ID);
+        verify(outboxService, never()).casStatus(OUTBOX_ID,
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.NEEDS_REVIEW.getCode());
+    }
+
+    @Test
+    void recoverRejectsFreshRollingBack() {
+        SeckillOutbox fresh = row(OUTBOX_ID, 19L, 1001L, OutboxStatus.ROLLING_BACK.getCode());
+        fresh.setUpdatedAt(LocalDateTime.now());
+        when(outboxService.findById(OUTBOX_ID)).thenReturn(fresh);
+
+        BusinessException e = assertThrows(BusinessException.class,
+                () -> controller.recover(OUTBOX_ID));
+
+        assertEquals(409, e.getCode());
+        verify(stockService, never()).rollback(anyLong(), anyLong(), any());
     }
 
     @Test
@@ -128,22 +215,26 @@ class OutboxAdminControllerTest {
                 () -> controller.recover(OUTBOX_ID));
 
         assertEquals(409, e.getCode());
-        verify(outboxService, never()).casStatus(anyLong(), anyInt(), anyInt());
+        verify(stockService, never()).rollback(anyLong(), anyLong(), any());
     }
 
-    /** 原线程刚好在这一刻落终态时，CAS 更新 0 行，必须如实报「你来晚了」而不是覆盖 */
+    /** 原线程刚好先落终态时，必须如实报冲突；库存可能已处理，状态仍不能退回 4。 */
     @Test
     void recoverReportsWhenStateChangedConcurrently() {
         when(outboxService.findById(OUTBOX_ID))
                 .thenReturn(row(OUTBOX_ID, 19L, 1001L, OutboxStatus.ROLLING_BACK.getCode()));
+        when(stockService.rollback(19L, 1001L, "r-" + OUTBOX_ID))
+                .thenReturn(RollbackOutcome.RESTORED);
         when(outboxService.casStatus(OUTBOX_ID,
-                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.NEEDS_REVIEW.getCode()))
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.ROLLED_BACK.getCode()))
                 .thenReturn(false);
 
         BusinessException e = assertThrows(BusinessException.class,
                 () -> controller.recover(OUTBOX_ID));
 
         assertEquals(409, e.getCode());
+        verify(outboxService, never()).casStatus(OUTBOX_ID,
+                OutboxStatus.ROLLING_BACK.getCode(), OutboxStatus.NEEDS_REVIEW.getCode());
     }
 
     private SeckillOutbox row(Long id, Long activityId, Long userId, int status) {
@@ -155,6 +246,7 @@ class OutboxAdminControllerTest {
         outbox.setStatus(status);
         outbox.setRetryCount(3);
         outbox.setLastError("broker 未确认");
+        outbox.setUpdatedAt(LocalDateTime.now().minusMinutes(3));
         return outbox;
     }
 }

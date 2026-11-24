@@ -120,141 +120,137 @@ public class OutboxAdminController {
     /**
      * 人工确认后回滚库存。
      * <p>
-     * <b>整个方法的核心是「不能被插队」</b>。上一版是
-     * 「查订单 → 回滚 Redis → 无条件改状态」，三步之间各自有窗口：
-     * 消费者可能在第二步之前把订单落库，复查任务可能同时把状态改成已消费，
-     * 结果就是「库存已还 + 订单已建」，或者「状态显示已消费、库存已还」。
+     * 状态 4 会先 CAS 到 5；状态 5 表示上一次回滚的结果不确定，可以直接幂等重试。
+     * <b>一旦进入 5，本方法不再把状态退回 4。</b>
      * <p>
-     * 现在用数据库做互斥点：
-     * <ol>
-     *   <li><b>CAS 认领</b>：{@code UPDATE ... SET status=5 WHERE id=? AND status=4}。
-     *       抢不到说明别人正在处理或状态已变，直接 409；</li>
-     *   <li>查订单——此刻这一行被我们独占，而消费者的落库事务里
-     *       也会 {@code FOR UPDATE} 锁同一行（见 mc-order 的 OrderPersistService），
-     *       所以「查订单」和「落库」不可能交错；</li>
-     *   <li>回滚 Redis，按三态分别处理：成功/无需动作 → 3；
-     *       <b>基础设施失败 → 退回 4</b>，绝不标记成已回滚。</li>
-     * </ol>
-     * 无论走哪条分支，状态都必须离开 5，否则这条记录既不会被复查任务扫到、
-     * 也不会出现在待复核列表里，等于永久失联——所以用 try/finally 兜底。
+     * Redis 回滚异常代表「命令可能已经执行，只是响应丢了」，不能据此认为库存没还。
+     * 这时必须继续用 5 挡住消费者；后续重试同一个 Lua 脚本是幂等的：
+     * 上一次已经归还时，本次 `SREM` 返回 0，不会重复增加库存。
+     * 只有拿到 RESTORED / NOTHING_TO_DO 的明确结果后，才允许 5 → 3。
+     * <p>
+     * 同理，Redis 已成功但最终 5 → 3 的数据库更新失败时也保留 5。
+     * 后续重试会再次执行幂等回滚并重新尝试落终态，绝不会开放消费者落单。
      */
     @PostMapping("/{id}/rollback")
     public Result<Map<String, Object>> rollback(@PathVariable Long id) {
-        SeckillOutbox outbox = outboxService.findById(id);
-        if (outbox == null) {
-            throw new BusinessException(404, "记录不存在");
-        }
-        if (outbox.getStatus() == null || outbox.getStatus() != OutboxStatus.NEEDS_REVIEW.getCode()) {
-            throw new BusinessException(409, "只有待人工复核的记录才能执行回滚，当前状态=" + outbox.getStatus());
-        }
+        SeckillOutbox outbox = requireOutbox(id);
+        int status = outbox.getStatus() == null ? -1 : outbox.getStatus();
 
-        // ① CAS 认领：4 → 5。抢不到说明并发的另一个请求（或复查任务）已经动过这一行
-        if (!outboxService.casStatus(id, OutboxStatus.NEEDS_REVIEW.getCode(),
-                OutboxStatus.ROLLING_BACK.getCode())) {
-            throw new BusinessException(409, "该记录正在被处理或状态已变更，请刷新后重试");
-        }
-
-        boolean settled = false;
-        try {
-            // ② 查订单：这一行已被我们锁住，消费者的落库事务会在这里阻塞
-            if (outboxService.orderExists(outbox.getActivityId(), outbox.getUserId())) {
-                if (outboxService.casStatus(id, OutboxStatus.ROLLING_BACK.getCode(),
-                        OutboxStatus.CONSUMED.getCode())) {
-                    settled = true;
-                    log.warn("复核时发现订单已落库，转为已消费，未回滚库存 "
-                                    + "outboxId={} activityId={} userId={}",
-                            id, outbox.getActivityId(), outbox.getUserId());
-                    throw new BusinessException(409,
-                            "该用户已有订单（消息迟到落库），已转为已消费，无需回滚");
-                }
-                throw new BusinessException(409, "订单已出现，但记录状态已被其他流程修改，请刷新核对");
+        if (status == OutboxStatus.NEEDS_REVIEW.getCode()) {
+            // 4 → 5 是第一次认领；抢不到说明有人已经先动手。
+            if (!outboxService.casStatus(id, OutboxStatus.NEEDS_REVIEW.getCode(),
+                    OutboxStatus.ROLLING_BACK.getCode())) {
+                throw new BusinessException(409, "该记录正在被处理或状态已变更，请刷新后重试");
             }
-
-            // ③ 回滚 Redis
-            RollbackOutcome outcome = stockService.rollback(
-                    outbox.getActivityId(), outbox.getUserId(), outbox.getReservationId());
-            if (outcome == RollbackOutcome.FAILED) {
-                // ★ 这是第三轮评审 P1 的核心：Redis 故障不能当成「已回滚」。
-                //   退回待复核，让运维在 Redis 恢复后重试；库存此刻仍是「已扣未还」的真实状态。
-                outboxService.casStatus(id, OutboxStatus.ROLLING_BACK.getCode(),
-                        OutboxStatus.NEEDS_REVIEW.getCode());
-                settled = true;
-                log.error("人工回滚时 Redis 异常，记录退回待复核 outboxId={} activityId={} userId={}",
-                        id, outbox.getActivityId(), outbox.getUserId());
-                throw new BusinessException(503, "库存服务暂时不可用，库存未回滚，记录已保留在待复核列表，请稍后重试");
-            }
-
-            if (!outboxService.casStatus(id, OutboxStatus.ROLLING_BACK.getCode(),
-                    OutboxStatus.ROLLED_BACK.getCode())) {
-                throw new BusinessException(409, "库存已处理，但记录状态已被其他流程修改，请刷新后核对");
-            }
-            settled = true;
-            log.warn("人工复核后回滚库存 outboxId={} activityId={} userId={} outcome={}",
-                    id, outbox.getActivityId(), outbox.getUserId(), outcome);
-
-            Map<String, Object> data = new LinkedHashMap<>();
-            data.put("outboxId", id);
-            data.put("outcome", outcome.name());
-            data.put("stockRestored", outcome == RollbackOutcome.RESTORED);
-            // NOTHING_TO_DO 有两种成因：用户本就不在买家集合（重复回滚），
-            // 或库存 key 已过期（活动结束）。都不是失败，但必须如实告诉操作者，
-            // 否则他会以为库存已经加回去了。
-            data.put("note", outcome == RollbackOutcome.RESTORED
-                    ? "库存已加回"
-                    : "库存 key 已过期或用户不在买家集合，无需加回");
-            return Result.ok(data);
-        } finally {
-            if (!settled) {
-                // 未预期的异常（比如查订单时数据库超时）：必须把记录退回待复核，
-                // 否则它会永远卡在 5，既不在待复核列表里，也不会被复查任务扫到
-                outboxService.casStatus(id, OutboxStatus.ROLLING_BACK.getCode(),
-                        OutboxStatus.NEEDS_REVIEW.getCode());
-                log.error("人工回滚过程异常，记录已退回待复核 outboxId={}", id);
-            }
+        } else if (status != OutboxStatus.ROLLING_BACK.getCode()) {
+            throw new BusinessException(409,
+                    "只有待人工复核或回滚执行中的记录才能回滚，当前状态=" + status);
+        } else {
+            log.warn("重试未完成的库存回滚 outboxId={} activityId={} userId={}",
+                    id, outbox.getActivityId(), outbox.getUserId());
         }
+
+        return resolveRollback(outbox);
     }
 
     /**
-     * 把一条卡在「回滚执行中(5)」的记录放回待复核(4)。
+     * 显式重试一条已经卡住的状态 5。
      * <p>
-     * <b>这个接口只能由人调用，调用前必须确认原来那次回滚已经不在了</b>——
-     * 服务重启过、原 HTTP 请求早已断开、或日志里能看到那次回滚已经结束。
+     * 不先退回 4：那会瞬间允许消费者落库，而 Redis 侧可能已经归还过库存。
+     * 这里保持在 5，直接执行幂等回滚；成功后才 5 → 3，失败则继续停在 5。
+     * 即使原回滚线程仍在运行，两边并发执行也是安全的：
+     * 消费者始终被 5 挡住，Redis 脚本按 `SREM` 返回值保证库存只还一次。
      * <p>
-     * <b>为什么不再自动做（第七轮评审 P0）</b>：状态 5 是排他凭据，
-     * 只要它是 5，消费者落库时就会拒绝（见 mc-order 的 {@code OrderPersistService}），
-     * 所以「谁持有 5 谁独占这一单」。而<b>时间证明不了持有者已死</b>：
-     * 原线程可能只是被 Redis 阻塞、被 GC 挂住、或者网关超时但线程还在跑。
-     * 一旦按时间自动放回 4，消费者立刻可以落库，原线程随后照旧回滚 Redis，
-     * 结果就是「库存已还 + 订单已建」——比记录卡住严重得多。
-     * <p>
-     * 换句话说：卡住的 5 只是「这批货暂时少卖」，最坏人工退掉；
-     * 而误判成已死会直接超卖。所以这里把决定权交给人，
-     * 定时任务只负责把它<b>列进</b> {@code GET /review}（{@code state=ROLLING_BACK_STALLED}）。
+     * 只有停留超过 {@link #STALL_SECONDS} 的记录才允许走这里，避免刚进入 5
+     * 的正常请求被误操作。
      */
     @PostMapping("/{id}/recover")
     public Result<Map<String, Object>> recover(@PathVariable Long id) {
-        SeckillOutbox outbox = outboxService.findById(id);
-        if (outbox == null) {
-            throw new BusinessException(404, "记录不存在");
-        }
+        SeckillOutbox outbox = requireOutbox(id);
         if (outbox.getStatus() == null
                 || outbox.getStatus() != OutboxStatus.ROLLING_BACK.getCode()) {
             throw new BusinessException(409,
                     "只有卡在回滚执行中(5)的记录才需要恢复，当前状态=" + outbox.getStatus());
         }
-        // CAS 而不是直接 UPDATE：万一原线程刚好在这一刻落终态，这里更新 0 行，
-        // 如实告诉调用者「你来晚了」，而不是把它从 3 覆盖回 4
-        if (!outboxService.casStatus(id, OutboxStatus.ROLLING_BACK.getCode(),
-                OutboxStatus.NEEDS_REVIEW.getCode())) {
-            throw new BusinessException(409, "该记录刚刚已经落终态，请刷新后再看");
+        if (!isStalled(outbox)) {
+            throw new BusinessException(409,
+                    "记录尚未达到 " + STALL_SECONDS + " 秒的卡住阈值，请稍后再试");
         }
-        log.warn("人工确认回滚线程已失效，记录退回待复核 outboxId={} activityId={} userId={}",
+        log.warn("人工重试卡住的库存回滚 outboxId={} activityId={} userId={}",
                 id, outbox.getActivityId(), outbox.getUserId());
+        return resolveRollback(outbox);
+    }
+
+    private SeckillOutbox requireOutbox(Long id) {
+        SeckillOutbox outbox = outboxService.findById(id);
+        if (outbox == null) {
+            throw new BusinessException(404, "记录不存在");
+        }
+        return outbox;
+    }
+
+    private boolean isStalled(SeckillOutbox outbox) {
+        return outbox.getUpdatedAt() != null
+                && !outbox.getUpdatedAt().isAfter(
+                        LocalDateTime.now().minusSeconds(STALL_SECONDS));
+    }
+
+    /**
+     * 在状态 5 的保护下完成一次幂等回滚。
+     * <p>
+     * 这个方向单向且不可回退：4/5 → 5 → 3（或发现订单 → 2）。
+     * 任何不确定性都保持 5，留待下一次重试或人工对账。
+     */
+    private Result<Map<String, Object>> resolveRollback(SeckillOutbox outbox) {
+        Long id = outbox.getId();
+
+        if (outboxService.orderExists(outbox.getActivityId(), outbox.getUserId())) {
+            if (outboxService.casStatus(id, OutboxStatus.ROLLING_BACK.getCode(),
+                    OutboxStatus.CONSUMED.getCode())) {
+                log.warn("复核时发现订单已落库，转为已消费，未回滚库存 "
+                                + "outboxId={} activityId={} userId={}",
+                        id, outbox.getActivityId(), outbox.getUserId());
+                throw new BusinessException(409,
+                        "该用户已有订单（消息迟到落库），已转为已消费，无需回滚");
+            }
+            throw new BusinessException(409,
+                    "订单已出现，但记录状态已被其他流程修改，请刷新核对");
+        }
+
+        RollbackOutcome outcome = stockService.rollback(
+                outbox.getActivityId(), outbox.getUserId(), outbox.getReservationId());
+        if (outcome == RollbackOutcome.FAILED) {
+            // Redis 超时/断连并不等于 Lua 没执行。保持 5，消费者不能落单；
+            // 后续重试同一个幂等脚本即可安全收敛。
+            log.error("人工回滚结果不确定，保留状态 5 等待重试 "
+                            + "outboxId={} activityId={} userId={}",
+                    id, outbox.getActivityId(), outbox.getUserId());
+            throw new BusinessException(503,
+                    "库存回滚结果暂时无法确认，记录保持在回滚执行中，可稍后重试");
+        }
+
+        if (!outboxService.casStatus(id, OutboxStatus.ROLLING_BACK.getCode(),
+                OutboxStatus.ROLLED_BACK.getCode())) {
+            // 库存可能已经归还，但终态没写成。绝不能退回 4；
+            // 保持在 5，下一次重试会得到 NOTHING_TO_DO 并再次尝试落 3。
+            log.error("库存回滚已得到明确结果，但状态未落终态，保留状态 5 "
+                            + "outboxId={} activityId={} userId={} outcome={}",
+                    id, outbox.getActivityId(), outbox.getUserId(), outcome);
+            throw new BusinessException(409,
+                    "库存已处理，但记录状态未落终态；记录保持在回滚执行中，请稍后重试");
+        }
+
+        log.warn("人工复核后回滚库存 outboxId={} activityId={} userId={} outcome={}",
+                id, outbox.getActivityId(), outbox.getUserId(), outcome);
 
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("outboxId", id);
-        data.put("status", OutboxStatus.NEEDS_REVIEW.getCode());
-        data.put("note", "已退回待复核，可再次调用 /rollback 执行回滚");
+        data.put("status", OutboxStatus.ROLLED_BACK.getCode());
+        data.put("outcome", outcome.name());
+        data.put("stockRestored", outcome == RollbackOutcome.RESTORED);
+        data.put("note", outcome == RollbackOutcome.RESTORED
+                ? "库存已加回"
+                : "库存 key 已过期或用户不在买家集合，无需加回");
         return Result.ok(data);
     }
 }

@@ -83,7 +83,7 @@ set DB_PASSWORD=<见本地配置>
 set DB_USERNAME=root
 set JWT_SECRET=<32 字节以上的随机串，三个服务必须一致>
 :: sql\05_reservation_id.sql 只能执行一次；当前数据库已完成，不要重复执行
-:: 新库还需执行 sql\06、sql\07、sql\08；当前数据库均已完成，不要重复执行 08
+:: 新库还需执行 sql\06、sql\07、sql\08、sql\09；当前数据库均已完成，不要重复执行 08
 :: 模拟登录只在 dev profile 下开启；不写这一行，/api/auth/token 就是 404
 java -jar mc-seckill\target\mc-seckill-1.0.0.jar --spring.profiles.active=dev
 java -jar mc-order\target\mc-order-1.0.0.jar
@@ -136,8 +136,8 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/auth/me
 | POST | `/api/seckill/order/{activityId}` | 抢购，返回 QUEUED / SOLD_OUT / REPEATED |
 | GET | `/api/order/result?activityId=` | 查结果：SUCCESS（带订单号）/ QUEUING / NOT_RESERVED |
 | GET | `/api/seckill/admin/outbox/review` | **管理员**：待人工处理的本地消息（待复核 4 + 卡住的回滚执行中 5） |
-| POST | `/api/seckill/admin/outbox/{id}/rollback` | **管理员**：人工确认后回滚库存（执行前再查一次订单） |
-| POST | `/api/seckill/admin/outbox/{id}/recover` | **管理员**：把卡在「回滚执行中(5)」的记录放回待复核（确认原请求已死之后才调） |
+| POST | `/api/seckill/admin/outbox/{id}/rollback` | **管理员**：人工确认后回滚库存；状态 5 可直接幂等重试，执行前再查一次订单 |
+| POST | `/api/seckill/admin/outbox/{id}/recover` | **管理员**：在卡住的状态 5 上幂等重试回滚，成功才进入 3，结果不确定仍保持 5 |
 
 ## 进度
 
@@ -153,6 +153,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/auth/me
 - [x] Day 6.8 第五轮修复：累计库存校验、请求 ID 限长、孤儿按状态恢复、对账上限、SQL 幂等
 - [x] Day 6.9 第六轮完善：商品库存真实预留、活动结束后安全释放、outbox 复用计数重置
 - [x] Day 6.10 第七轮修复：取消状态 5 按时间自动回收、补活动维度索引、投递标记带预订号、生产者自愈
+- [x] Day 6.11 第八轮修复：状态 5 内幂等重试回滚，Redis/数据库结果不确定时继续隔离消费者
 - [ ] Day 7 面试问答整理
 
 ## 代码评审修复 · 第一轮（P0/P1/P2）
@@ -207,7 +208,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/api/auth/me
 |---|---|---|
 | P0 | 模拟登录开关写在基础配置里（`mock-login-enabled: true`），所有环境默认全开，任何人都能签 ADMIN token | 基础配置恒为 `false`，`true` 挪进 `application-dev.yml`。**实测**：不带 profile 启动，`/api/auth/token` 返回 404；带 `--spring.profiles.active=dev` 才 200 |
 | P0 | 孤儿兜底任务「查 outbox → 回滚」两步不原子。一个只是**慢**的请求（GC 停顿 / 连接池排队超过 60 秒宽限期）会被判成孤儿：任务归还库存，原请求随后恢复、写 outbox、发 MQ，订单照样落库 → **超卖** | 引入**原子认领 + 租约**：兜底任务必须先 `SET NX` 拿到 `orphan-claim:{userId}`（带 30 秒 TTL）才能动手，认领动作与「是否超期」判断在同一个 Lua 里；原请求在发 MQ 前调用 `confirmDeduct`，它会检查 claim —— 在，说明已被接管，立刻把 outbox 行标记为 `ABORTED(6)` 墓碑 + 回滚库存 + **不再投递**（用墓碑不用删除：删掉后消费者查不到记录会照常建单，而库存已还） |
-| P1 | `rollback` 返回 boolean，把「用户不在买家集合」和「Redis 故障」混成一个 false；管理接口据此照样标成「已回滚」，于是出现「状态说已还、库存一件没还」的脏记录 | 改成三态 `RESTORED / NOTHING_TO_DO / FAILED`：Lua 用 `SREM` 返回值区分 0（重复回滚）与 -1（库存 key 已过期），异常才是 FAILED。管理接口只在非 FAILED 时写 ROLLED_BACK，FAILED 退回 NEEDS_REVIEW 并返回 503 |
+| P1 | `rollback` 返回 boolean，把「用户不在买家集合」和「Redis 故障」混成一个 false；管理接口据此照样标成「已回滚」，于是出现「状态说已还、库存一件没还」的脏记录 | 改成三态 `RESTORED / NOTHING_TO_DO / FAILED`：Lua 用 `SREM` 返回值区分 0（重复回滚）与 -1（库存 key 已过期），异常才是 FAILED。管理接口只在非 FAILED 时写 ROLLED_BACK；FAILED 早期退回 4，第八轮起改为保持 5 并返回 503 |
 | P1 | 人工回滚「查订单 → 回滚 Redis → 改状态」三步各有窗口；消费者可能在中途落库，复查任务也可能同时改状态 | 引入过渡态 `ROLLING_BACK(5)`：管理接口先 `UPDATE ... SET status=5 WHERE id=? AND status=4` 抢独占；订单落库事务里 `SELECT ... FROM seckill_outbox WHERE activity_id=? AND user_id=? FOR UPDATE` 锁同一行，读到 3/5 直接拒绝落库（抛 `OrderRejectedException`，消费者确认消费而不是空转重试） |
 | P2 | `reviewPending()` 没续租；`relayPending()` 丢锁后只退自己，后续对账/复查照跑；状态更新无条件，会跨状态覆盖 | 三个子任务返回 boolean，丢锁即中止后续；复查循环每条前续租；所有状态流转改 `casStatus(id, from, to)` |
 | P2 | 被人工回滚过的用户再抢购会撞 `uk_user_activity`，被当成「重复购买」拒绝，可他其实什么都没买到 | 撞唯一键时先查那一行的状态：`ROLLED_BACK` 就复用该行（CAS 3→0、刷新 payload 与重试计数）继续下单，其余状态才返回 REPEATED |
@@ -339,9 +340,9 @@ outbox status=6 + 直接投一条合法消息 → 消费者读到 6 → 拒绝�
 **2. 回滚三态（P1）** —— 两次真实故障：
 
 ```
-用户不在买家集合         → outcome=NOTHING_TO_DO，status 4→3（可以收尾）
-停掉 Redis 再点回滚      → HTTP 503，status 仍是 4（没有标成已回滚）
-Redis 恢复后再点        → outcome=RESTORED，stock 19→20，status 4→3
+用户不在买家集合         → outcome=NOTHING_TO_DO，status 4→5→3（可以收尾）
+停掉 Redis 再点回滚      → HTTP 503，status 保持 5（结果未知，消费者不能落单）
+Redis 恢复后重试        → outcome=RESTORED，stock 19→20，status 5→3
 再点一次                → 409「当前状态=3」
 ```
 
@@ -384,7 +385,8 @@ outbox status=4（仅待复核）  → 同一份消息再投一次      → 订�
   `userId + activityId` 做模糊判断。
 - 订单消费者事务内先把 outbox 从 `PENDING/SENT/NEEDS_REVIEW` 认领为 `CONSUMING(7)`，
   订单、商品库存和活动库存提交后再改为 `CONSUMED(2)`；入口墓碑因此不会覆盖已进入消费的消息。
-- 状态 `ROLLING_BACK(5)` 超过 120 秒未收敛时自动退回待复核，解决进程崩溃后永久卡死。
+- 状态 `ROLLING_BACK(5)` 超过 120 秒未收敛时自动退回待复核（该策略在第七轮删除，
+  第八轮改为保持 5 并幂等重试，避免结果未知时重新开放消费者落单）。
 - 发布活动时重新校验商品当前价格和库存；到期活动自动转为 `FINISHED`。
 - 新增 JWT/签名/预订号/订单落库状态机测试；`concurrent_seckill.py` 改为经网关鉴权，
   `e2e_check.py` 改为有截止时间的轮询。
@@ -492,7 +494,7 @@ broker 不可用时补偿任务单轮最坏 40 秒，这期间预热和释放全
 
 | 级别 | 问题 | 核实结论 | 修复 |
 |---|---|---|---|
-| P0 | 人工回滚进入状态 5 后没有所有权/心跳，120 秒后被恢复任务无条件改回 4 | **属实**（比描述的更严重，见下） | 删掉 `recoverStaleRollingBack`；卡住的 5 进管理端列表（`state=ROLLING_BACK_STALLED`），由 `POST /{id}/recover` 显式放回 4 |
+| P0 | 人工回滚进入状态 5 后没有所有权/心跳，120 秒后被恢复任务无条件改回 4 | **属实**（比描述的更严重，见下） | 第七轮删掉 `recoverStaleRollingBack`；第八轮进一步取消 `5 → 4` 恢复，改为在 5 上幂等重试回滚 |
 | P1 | `countActiveByActivity` 与 `findReleasableReservations` 的 `NOT EXISTS` 没有以 `activity_id` 打头的索引 | **属实**，EXPLAIN 实测走 `idx_status_retry`（status 基数极低）| 新增 `sql/09_outbox_activity_index.sql`：`idx_activity_status(activity_id, status)`，幂等 |
 | P2 | `markSent` 只按 `activity_id + user_id` 更新，记录被复用后旧线程会误标新预订 | **属实**（后果是延迟 5 分钟投递，不是丢消息） | where 加 `reservation_id`，接口签名同步改 |
 | P2 | 生产者启动异常被吞掉后没有后台重启路径 | **机制存在，但触发条件比描述窄**（见下） | 仿消费者的 `ensureStarted()`：每 30 秒检查，失败就新建实例重启 |
@@ -518,7 +520,8 @@ broker 不可用时补偿任务单轮最坏 40 秒，这期间预热和释放全
 的低频操作，成本明显不划算。
 
 现在的处置链是：卡住的 5 出现在 `GET /review`（`state=ROLLING_BACK_STALLED`），
-运维确认「那次请求确实没了」（服务重启过 / 日志里已结束）再调 `POST /{id}/recover`。
+运维确认「那次请求确实没了」（服务重启过 / 日志里已结束）再调 `POST /{id}/recover`；
+该接口直接在状态 5 上幂等重试库存回滚，不再先放回 4。
 最坏结果是这批货暂时少卖、人工退掉；比超卖轻一个量级——和「重试耗尽不自动回滚」是同一条原则。
 
 **P2 生产者那条要说清楚。** 机制确实缺：`@PostConstruct` 里 `producer.start()` 失败后
@@ -554,7 +557,7 @@ Nacos/RocketMQ 两个重中间件，容器化的收益低于「一个能复现�
       NOT EXISTS 子查询：前 range 扫 → 后 ref + Using index + Not exists
 状态 5：插入一条 updated_at=5 分钟前的 status=5 记录，25 秒（补偿任务 5 轮）后仍是 5（旧代码这里会变 4）
         GET /review → state=ROLLING_BACK_STALLED
-        POST /recover → 200 {status:4}；再调 → 409；不存在的 id → 404
+        第七轮当时 POST /recover → 200 {status:4}；第八轮已改为在状态 5 上直接重试回滚
 e2e 3 人抢 5 件（活动 22，商品 10）：
         基线 255 → 发布 250（预留 5）→ 3 单落库后仍 250（无二次扣减）
         → 结束后归还未售 2 件 → 252
@@ -564,6 +567,37 @@ producer 自愈：停 NameServer 起服务，start() 仍成功（说明这条是
         NameServer 恢复后 send 第 1 次失败、第 2 次成功，未重启服务
 测试：42 个（新增 OutboxAdminControllerTest 6 个）全绿
 ```
+
+## 代码评审修复 · 第八轮
+
+再次检查发现，第七轮虽然删除了状态 5 的定时自动回收，但人工回滚接口自己仍有两条
+`5 → 4` 路径：
+
+1. Redis 回滚返回 `FAILED` 时，代码把它解释成“库存没还”，随后退回 4；
+2. Redis 已成功、但最终 `5 → 3` 更新失败时，`finally` 又尝试退回 4。
+
+Redis 超时代表命令**可能已经执行，只是响应丢了**。状态一旦退回 4，消费者就能落单；
+而库存可能已经归还，结果就是超卖。`finally` 只适合撤销还没有产生外部副作用的操作，
+不能用来处理“Redis 结果未知”。
+
+本轮的最终状态机是：
+
+```
+4 --CAS--> 5 --明确回滚结果--> 3
+              |
+              +--Redis 失败 / DB 终态失败 / 其他异常--> 保持 5，等待幂等重试
+```
+
+关键变化：
+
+- `/rollback` 接受状态 4 或 5。状态 5 不先退回 4，直接在 5 上重试幂等 Lua；
+- `/recover` 只接受停留超过 120 秒的状态 5，且同样直接在 5 上重试；
+- 只有 `RESTORED / NOTHING_TO_DO` 后才尝试 `5 → 3`；
+- `FAILED`、数据库异常和终态 CAS 失败都不再退回 4；
+- 多个实例并发重试是安全的：状态 5 始终挡住消费者，Lua 以 `SREM` 返回值保证库存最多只加回一次。
+
+新增测试覆盖 Redis 失败、Redis 成功但 DB 终态失败、状态 5 重试、未到 120 秒拒绝恢复等分支。
+验证结果：`mvn test` → **47/47 测试通过**，全部模块 `BUILD SUCCESS`。
 
 ## 关键设计
 
